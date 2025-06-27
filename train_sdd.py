@@ -135,6 +135,10 @@ def parse_args() -> argparse.Namespace:
         help="Allow the use of TF32. Only works on certain GPUs.")
     parser.add_argument("--use_fp16", action="store_true", 
         help="Whether to use 16-bit (mixed) precision (through NVIDIA apex) instead of 32-bit.")
+    parser.add_argument("--enable_xformers", action="store_true",
+        help="Enable xformers for memory efficient attention.")
+    parser.add_argument("--gradient_checkpointing", action="store_true",
+        help="Enable gradient checkpointing to save memory.")
     parser.add_argument("--devices", type=int, nargs="+", default=[0, 0])
     
     parser.add_argument("--use_wandb", action="store_true",)
@@ -428,12 +432,13 @@ def encode_prompt(
             truncation=True,
             return_tensors="pt",
         )
-        uncond_emb_2 = encode_with_text_encoder(uncond_input_2["input_ids"], uncond_input_2["attention_mask"], text_encoder_2, use_pooled=True)
+        uncond_emb_2 = encode_with_text_encoder(uncond_input_2["input_ids"], uncond_input_2["attention_mask"], text_encoder_2)
+        uncond_pooled_2 = encode_with_text_encoder(uncond_input_2["input_ids"], uncond_input_2["attention_mask"], text_encoder_2, use_pooled=True)
         
         # For SDXL, concatenate embeddings from both text encoders along the feature dimension
         uncond_emb = torch.cat([uncond_emb_1, uncond_emb_2], dim=-1)
         prompt_embeds = uncond_emb
-        pooled_prompt_embeds = encode_with_text_encoder(uncond_input_2["input_ids"], uncond_input_2["attention_mask"], text_encoder_2, use_pooled=True)
+        pooled_prompt_embeds = uncond_pooled_2
         
         if prompt_input is not None:
             prompt_emb_1 = encode_with_text_encoder(prompt_input["input_ids"], prompt_input["attention_mask"], text_encoder)
@@ -781,6 +786,17 @@ def main():
     unet_student = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant,
     )
+
+    # Memory optimizations
+    if args.enable_xformers:
+        try:
+            unet_teacher.enable_xformers_memory_efficient_attention()
+            unet_student.enable_xformers_memory_efficient_attention()
+        except Exception as e:
+            logger.warning(f"Could not enable xformers memory efficient attention: {e}")
+    
+    if args.gradient_checkpointing:
+        unet_student.enable_gradient_checkpointing()
 
     # Freeze vae and text_encoder
     unet_teacher.requires_grad_(False)
