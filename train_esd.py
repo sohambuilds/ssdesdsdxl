@@ -407,9 +407,9 @@ def encode_prompt(
         )
         uncond_emb_2, uncond_pooled_2 = encode_with_text_encoder(uncond_input_2["input_ids"], uncond_input_2["attention_mask"], text_encoder_2)
         
-        # For SDXL, we don't concatenate the embeddings, we use them separately
-        # uncond_emb_1 is the main text embedding (3D), uncond_emb_2 is pooled (2D)
-        prompt_embeds = uncond_emb_1
+        # For SDXL, concatenate the embeddings from both text encoders along the feature dimension
+        uncond_emb = torch.cat([uncond_emb_1, uncond_emb_2], dim=-1)
+        prompt_embeds = uncond_emb
         pooled_prompt_embeds = uncond_pooled_2
         
         if prompt_input is not None:
@@ -424,7 +424,7 @@ def encode_prompt(
             )
             prompt_emb_2, prompt_pooled_2 = encode_with_text_encoder(prompt_input_2["input_ids"], prompt_input_2["attention_mask"], text_encoder_2)
             
-            prompt_emb = prompt_emb_1
+            prompt_emb = torch.cat([prompt_emb_1, prompt_emb_2], dim=-1)
             prompt_embeds = torch.cat([prompt_embeds, prompt_emb], dim=0)
             pooled_prompt_embeds = torch.cat([pooled_prompt_embeds, prompt_pooled_2], dim=0)
         
@@ -440,7 +440,7 @@ def encode_prompt(
             )
             removing_emb_2, removing_pooled_2 = encode_with_text_encoder(removing_input_2["input_ids"], removing_input_2["attention_mask"], text_encoder_2)
             
-            removing_emb = removing_emb_1
+            removing_emb = torch.cat([removing_emb_1, removing_emb_2], dim=-1)
             prompt_embeds = torch.cat([prompt_embeds, removing_emb], dim=0)
             pooled_prompt_embeds = torch.cat([pooled_prompt_embeds, removing_pooled_2], dim=0)
         

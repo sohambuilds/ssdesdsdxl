@@ -430,9 +430,10 @@ def encode_prompt(
         )
         uncond_emb_2 = encode_with_text_encoder(uncond_input_2["input_ids"], uncond_input_2["attention_mask"], text_encoder_2, use_pooled=True)
         
-        # For SDXL, we don't concatenate the embeddings, we use them separately
-        # uncond_emb_1 is the main text embedding (3D), uncond_emb_2 is pooled (2D)
-        prompt_embeds = uncond_emb_1
+        # For SDXL, concatenate embeddings from both text encoders along the feature dimension
+        uncond_emb = torch.cat([uncond_emb_1, uncond_emb_2], dim=-1)
+        prompt_embeds = uncond_emb
+        pooled_prompt_embeds = encode_with_text_encoder(uncond_input_2["input_ids"], uncond_input_2["attention_mask"], text_encoder_2, use_pooled=True)
         
         if prompt_input is not None:
             prompt_emb_1 = encode_with_text_encoder(prompt_input["input_ids"], prompt_input["attention_mask"], text_encoder)
@@ -444,10 +445,12 @@ def encode_prompt(
                 truncation=True,
                 return_tensors="pt",
             )
-            prompt_emb_2 = encode_with_text_encoder(prompt_input_2["input_ids"], prompt_input_2["attention_mask"], text_encoder_2, use_pooled=True)
+            prompt_emb_2 = encode_with_text_encoder(prompt_input_2["input_ids"], prompt_input_2["attention_mask"], text_encoder_2)
+            prompt_pooled_2 = encode_with_text_encoder(prompt_input_2["input_ids"], prompt_input_2["attention_mask"], text_encoder_2, use_pooled=True)
             
-            prompt_emb = prompt_emb_1
+            prompt_emb = torch.cat([prompt_emb_1, prompt_emb_2], dim=-1)
             prompt_embeds = torch.cat([prompt_embeds, prompt_emb], dim=0)
+            pooled_prompt_embeds = torch.cat([pooled_prompt_embeds, prompt_pooled_2], dim=0)
         
         if removing_input is not None:
             removing_emb_1 = encode_with_text_encoder(removing_input["input_ids"], removing_input["attention_mask"], text_encoder)
@@ -459,9 +462,10 @@ def encode_prompt(
                 truncation=True,
                 return_tensors="pt",
             )
-            removing_emb_2 = encode_with_text_encoder(removing_input_2["input_ids"], removing_input_2["attention_mask"], text_encoder_2, use_pooled=True)
+            removing_emb_2 = encode_with_text_encoder(removing_input_2["input_ids"], removing_input_2["attention_mask"], text_encoder_2)
+            removing_pooled_2 = encode_with_text_encoder(removing_input_2["input_ids"], removing_input_2["attention_mask"], text_encoder_2, use_pooled=True)
             
-            removing_emb = removing_emb_1
+            removing_emb = torch.cat([removing_emb_1, removing_emb_2], dim=-1)
             prompt_embeds = torch.cat([prompt_embeds, removing_emb], dim=0)
             pooled_prompt_embeds = torch.cat([pooled_prompt_embeds, removing_pooled_2], dim=0)
         
@@ -538,6 +542,7 @@ def sample_until(
     prompt_embeds: torch.Tensor,
     guidance_scale: float,
     extra_step_kwargs: Optional[Dict[str, Any]]=None,
+    added_cond_kwargs: Optional[Dict[str, Any]]=None,
 ):
     """Sample latents until t for a given prompt."""
     timesteps = scheduler.timesteps
@@ -554,7 +559,12 @@ def sample_until(
         latent_model_input = scheduler.scale_model_input(latent_model_input, t)
 
         # predict the noise residual
-        noise_pred = unet(latent_model_input, t, encoder_hidden_states=prompt_embeds).sample
+        noise_pred = unet(
+            latent_model_input, 
+            t, 
+            encoder_hidden_states=prompt_embeds,
+            added_cond_kwargs=added_cond_kwargs,
+        ).sample
 
         # perform guidance
         if do_guidance:
@@ -630,6 +640,25 @@ def train_step(
     extra_step_kwargs = prepare_extra_step_kwargs(noise_scheduler, generator, args.eta)
 
     with torch.no_grad():
+        # Prepare conditioning for sample_until
+        added_cond_kwargs = None
+        if pooled_prompt_embeds is not None and add_time_ids is not None:
+            uncond_pooled, cond_pooled, safety_pooled = torch.chunk(pooled_prompt_embeds, 3, dim=0)
+            uncond_time_ids, cond_time_ids, safety_time_ids = torch.chunk(add_time_ids, 3, dim=0)
+            
+            if args.guidance_scale > 1.0:
+                # Use guidance conditioning (uncond + cond)
+                added_cond_kwargs = {
+                    "text_embeds": torch.cat([uncond_pooled, cond_pooled], dim=0),
+                    "time_ids": torch.cat([uncond_time_ids, cond_time_ids], dim=0),
+                }
+            else:
+                # Use only uncond
+                added_cond_kwargs = {
+                    "text_embeds": uncond_pooled,
+                    "time_ids": uncond_time_ids,
+                }
+        
         # Generate latents
         latents = sample_until(
             until=int(t_ddim),
@@ -639,6 +668,7 @@ def train_step(
             prompt_embeds=torch.cat([uncond_emb, cond_emb], dim=0) if args.guidance_scale > 1.0 else uncond_emb,
             guidance_scale=args.guidance_scale,
             extra_step_kwargs=extra_step_kwargs,
+            added_cond_kwargs=added_cond_kwargs,
         )
 
     latents = latents.to(unet_student.device)
