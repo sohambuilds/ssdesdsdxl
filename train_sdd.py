@@ -353,6 +353,9 @@ def encode_prompt(
     device: torch.device=None,
     text_encoder_2: Optional[CLIPTextModel]=None,
     tokenizer_2: Optional[CLIPTokenizer]=None,
+    target_size: tuple = (1024, 1024),
+    original_size: tuple = (1024, 1024),
+    crops_coords_top_left: tuple = (0, 0),
 ):
     """Encode a prompt into a text embedding. Prompt can be None."""
     # Get text embeddings for unconditional and conditional prompts.
@@ -427,8 +430,9 @@ def encode_prompt(
         )
         uncond_emb_2 = encode_with_text_encoder(uncond_input_2["input_ids"], uncond_input_2["attention_mask"], text_encoder_2, use_pooled=True)
         
-        # Concatenate embeddings
-        prompt_embeds = torch.cat([uncond_emb_1, uncond_emb_2], dim=-1)
+        # For SDXL, we don't concatenate the embeddings, we use them separately
+        # uncond_emb_1 is the main text embedding (3D), uncond_emb_2 is pooled (2D)
+        prompt_embeds = uncond_emb_1
         
         if prompt_input is not None:
             prompt_emb_1 = encode_with_text_encoder(prompt_input["input_ids"], prompt_input["attention_mask"], text_encoder)
@@ -442,7 +446,7 @@ def encode_prompt(
             )
             prompt_emb_2 = encode_with_text_encoder(prompt_input_2["input_ids"], prompt_input_2["attention_mask"], text_encoder_2, use_pooled=True)
             
-            prompt_emb = torch.cat([prompt_emb_1, prompt_emb_2], dim=-1)
+            prompt_emb = prompt_emb_1
             prompt_embeds = torch.cat([prompt_embeds, prompt_emb], dim=0)
         
         if removing_input is not None:
@@ -457,18 +461,35 @@ def encode_prompt(
             )
             removing_emb_2 = encode_with_text_encoder(removing_input_2["input_ids"], removing_input_2["attention_mask"], text_encoder_2, use_pooled=True)
             
-            removing_emb = torch.cat([removing_emb_1, removing_emb_2], dim=-1)
+            removing_emb = removing_emb_1
             prompt_embeds = torch.cat([prompt_embeds, removing_emb], dim=0)
+            pooled_prompt_embeds = torch.cat([pooled_prompt_embeds, removing_pooled_2], dim=0)
+        
+        # Create time_ids for SDXL
+        add_time_ids = list(original_size + crops_coords_top_left + target_size)
+        add_time_ids = torch.tensor([add_time_ids], dtype=prompt_embeds.dtype, device=device)
+        
+        # Create time_ids for all three embeddings: uncond, cond (if exists), safety (if exists)
+        all_time_ids = [add_time_ids]  # Start with uncond
+        if prompt_input is not None:
+            all_time_ids.append(add_time_ids)  # Add cond
+        if removing_input is not None:
+            all_time_ids.append(add_time_ids)  # Add safety
+        
+        add_time_ids = torch.cat(all_time_ids, dim=0)
+        
     else:
         # Standard SD single text encoder encoding
-        prompt_embeds = encode_with_text_encoder(uncond_input["input_ids"], uncond_input["attention_mask"], text_encoder)
+        prompt_embeds, _ = encode_with_text_encoder(uncond_input["input_ids"], uncond_input["attention_mask"], text_encoder)
+        pooled_prompt_embeds = None
+        add_time_ids = None
         
         if prompt_input is not None:
-            prompt_emb = encode_with_text_encoder(prompt_input["input_ids"], prompt_input["attention_mask"], text_encoder)
+            prompt_emb, _ = encode_with_text_encoder(prompt_input["input_ids"], prompt_input["attention_mask"], text_encoder)
             prompt_embeds = torch.cat([prompt_embeds, prompt_emb], dim=0)
         
         if removing_input is not None:
-            removing_emb = encode_with_text_encoder(removing_input["input_ids"], removing_input["attention_mask"], text_encoder)
+            removing_emb, _ = encode_with_text_encoder(removing_input["input_ids"], removing_input["attention_mask"], text_encoder)
             prompt_embeds = torch.cat([prompt_embeds, removing_emb], dim=0)
 
     # Duplicate the embeddings for each image.
@@ -476,8 +497,15 @@ def encode_prompt(
         seq_len = prompt_embeds.shape[1]
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
         prompt_embeds = prompt_embeds.reshape(batch_size * num_images_per_prompt, seq_len, -1)
+        
+        if pooled_prompt_embeds is not None:
+            pooled_prompt_embeds = pooled_prompt_embeds.repeat(1, num_images_per_prompt, 1)
+            pooled_prompt_embeds = pooled_prompt_embeds.reshape(batch_size * num_images_per_prompt, -1)
+        
+        if add_time_ids is not None:
+            add_time_ids = add_time_ids.repeat(num_images_per_prompt, 1)
     
-    return prompt_embeds
+    return prompt_embeds, pooled_prompt_embeds, add_time_ids
 
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_extra_step_kwargs
@@ -566,7 +594,7 @@ def train_step(
     unet_student.train()
 
     # Encode prompt
-    prompt_embeds = encode_prompt(
+    prompt_embeds, pooled_prompt_embeds, add_time_ids = encode_prompt(
         prompt=prompt, 
         removing_prompt=removing_prompt,
         text_encoder=text_encoder, 
@@ -574,6 +602,7 @@ def train_step(
         device=devices[1],
         text_encoder_2=text_encoder_2,
         tokenizer_2=tokenizer_2,
+        target_size=(args.resolution, args.resolution),
     )
     
     uncond_emb, cond_emb, safety_emb = torch.chunk(prompt_embeds, 3, dim=0)
@@ -617,9 +646,27 @@ def train_step(
     c_0 = uncond_emb.to(unet_student.device)
     c_s = safety_emb.to(unet_student.device)
 
+    # Prepare SDXL conditioning if needed
+    added_cond_kwargs = None
+    if pooled_prompt_embeds is not None and add_time_ids is not None:
+        uncond_pooled, cond_pooled, safety_pooled = torch.chunk(pooled_prompt_embeds, 3, dim=0)
+        uncond_time_ids, cond_time_ids, safety_time_ids = torch.chunk(add_time_ids, 3, dim=0)
+        
+        uncond_added_cond_kwargs = {
+            "text_embeds": uncond_pooled.to(unet_student.device),
+            "time_ids": uncond_time_ids.to(unet_student.device),
+        }
+        safety_added_cond_kwargs = {
+            "text_embeds": safety_pooled.to(unet_student.device),
+            "time_ids": safety_time_ids.to(unet_student.device),
+        }
+    else:
+        uncond_added_cond_kwargs = None
+        safety_added_cond_kwargs = None
+
     with torch.no_grad():
-        e_0 = unet_student(latents, t_ddpm, encoder_hidden_states=c_0).sample
-    e_s = unet_student(latents, t_ddpm, encoder_hidden_states=c_s).sample
+        e_0 = unet_student(latents, t_ddpm, encoder_hidden_states=c_0, added_cond_kwargs=uncond_added_cond_kwargs).sample
+    e_s = unet_student(latents, t_ddpm, encoder_hidden_states=c_s, added_cond_kwargs=safety_added_cond_kwargs).sample
 
     loss = F.mse_loss(e_0.detach(), e_s)
     return loss

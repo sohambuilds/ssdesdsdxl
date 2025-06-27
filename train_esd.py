@@ -407,8 +407,9 @@ def encode_prompt(
         )
         uncond_emb_2, uncond_pooled_2 = encode_with_text_encoder(uncond_input_2["input_ids"], uncond_input_2["attention_mask"], text_encoder_2)
         
-        # Concatenate embeddings
-        prompt_embeds = torch.cat([uncond_emb_1, uncond_emb_2], dim=-1)
+        # For SDXL, we don't concatenate the embeddings, we use them separately
+        # uncond_emb_1 is the main text embedding (3D), uncond_emb_2 is pooled (2D)
+        prompt_embeds = uncond_emb_1
         pooled_prompt_embeds = uncond_pooled_2
         
         if prompt_input is not None:
@@ -423,7 +424,7 @@ def encode_prompt(
             )
             prompt_emb_2, prompt_pooled_2 = encode_with_text_encoder(prompt_input_2["input_ids"], prompt_input_2["attention_mask"], text_encoder_2)
             
-            prompt_emb = torch.cat([prompt_emb_1, prompt_emb_2], dim=-1)
+            prompt_emb = prompt_emb_1
             prompt_embeds = torch.cat([prompt_embeds, prompt_emb], dim=0)
             pooled_prompt_embeds = torch.cat([pooled_prompt_embeds, prompt_pooled_2], dim=0)
         
@@ -439,17 +440,22 @@ def encode_prompt(
             )
             removing_emb_2, removing_pooled_2 = encode_with_text_encoder(removing_input_2["input_ids"], removing_input_2["attention_mask"], text_encoder_2)
             
-            removing_emb = torch.cat([removing_emb_1, removing_emb_2], dim=-1)
+            removing_emb = removing_emb_1
             prompt_embeds = torch.cat([prompt_embeds, removing_emb], dim=0)
             pooled_prompt_embeds = torch.cat([pooled_prompt_embeds, removing_pooled_2], dim=0)
         
         # Create time_ids for SDXL
         add_time_ids = list(original_size + crops_coords_top_left + target_size)
         add_time_ids = torch.tensor([add_time_ids], dtype=prompt_embeds.dtype, device=device)
+        
+        # Create time_ids for all three embeddings: uncond, cond (if exists), safety (if exists)
+        all_time_ids = [add_time_ids]  # Start with uncond
         if prompt_input is not None:
-            add_time_ids = torch.cat([add_time_ids, add_time_ids], dim=0)
+            all_time_ids.append(add_time_ids)  # Add cond
         if removing_input is not None:
-            add_time_ids = torch.cat([add_time_ids, add_time_ids], dim=0)
+            all_time_ids.append(add_time_ids)  # Add safety
+        
+        add_time_ids = torch.cat(all_time_ids, dim=0)
         
     else:
         # Standard SD single text encoder encoding
